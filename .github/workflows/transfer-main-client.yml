@@ -1,0 +1,80 @@
+name: Transfer verified MAIN client to Releases
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: main-client-github-transfer
+  cancel-in-progress: false
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: DungeonReborne/launcher
+    steps:
+      - name: Transfer exact signed client payload and verify every asset
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,pathlib,subprocess,urllib.parse
+          REPO='DungeonReborne/launcher'
+          RID=444744062
+          TAG='client-production-0.4.72-bbfa7f0fb57d'
+          def gh(*args):
+              return subprocess.check_output(['gh',*args])
+          def api(path):
+              return json.loads(gh('api','repos/'+REPO+'/'+path))
+          def assets():
+              pages=json.loads(gh('api','repos/'+REPO+'/releases/'+str(RID)+'/assets?per_page=100','--paginate','--slurp'))
+              return {x['name']:x for page in pages for x in page}
+          def sha(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda:f.read(4*1024*1024),b''):h.update(b)
+              return h.hexdigest()
+          release=api('releases/'+str(RID))
+          assert release['tag_name']==TAG and release['name']=='DungeonReborne MAIN client 0.4.72'
+          current=assets()
+          raw=gh('api','repos/'+REPO+'/releases/assets/'+str(current['client-release.json']['id']),'-H','Accept: application/octet-stream')
+          assert hashlib.sha256(raw).hexdigest()=='8b224e627f8d75f3bb2475d08bb91292bbe1c2f192f9b7e0b9095d481a1ed355'
+          m=json.loads(raw)
+          assert m['base_url']=='https://dungeonreborne.com/downloads/client/0.4.72/'
+          expected={p['asset']:p for f in m['files'] for p in f['github_parts']}
+          assert len(expected)==472 and len(m['files'])==461
+          def matches(row,p):
+              return row and row['state']=='uploaded' and row['size']==p['bytes'] and row.get('digest')=='sha256:'+p['sha256']
+          source=pathlib.Path('source.tmp')
+          for i,f in enumerate(m['files']):
+              if all(matches(current.get(p['asset']),p) for p in f['github_parts']):
+                  continue
+              url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
+              subprocess.run(['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','-o',str(source),url],check=True)
+              assert source.stat().st_size==f['bytes'] and sha(source)==f['sha256'],f['path']
+              with source.open('rb') as stream:
+                  for p in f['github_parts']:
+                      if matches(current.get(p['asset']),p):
+                          stream.seek(p['bytes'],1)
+                          continue
+                      target=pathlib.Path(p['asset']);remain=p['bytes']
+                      with target.open('wb') as out:
+                          while remain:
+                              block=stream.read(min(remain,4*1024*1024));assert block
+                              out.write(block);remain-=len(block)
+                      assert sha(target)==p['sha256']
+                      old=current.get(p['asset'])
+                      if old:
+                          assert old['state']!='uploaded','Refuse replacing an existing complete asset'
+                          gh('api','-X','DELETE','repos/'+REPO+'/releases/assets/'+str(old['id']))
+                      gh('release','upload',TAG,str(target),'--repo',REPO)
+                      target.unlink()
+                      print('UPLOADED',p['asset'],p['bytes'],flush=True)
+              source.unlink()
+              print('FILE_VERIFIED',i+1,len(m['files']),flush=True)
+          current=assets()
+          for name,p in expected.items():assert matches(current.get(name),p),name
+          assert set(current)==set(expected)|{'client-release.json','client-release.json.sig'}
+          gh('api','-X','PATCH','repos/'+REPO+'/releases/'+str(RID),'-F','draft=false','-F','prerelease=true','-f','make_latest=false')
+          print('MAIN_GITHUB_PAYLOAD_PUBLISHED',len(expected),sum(p['bytes'] for p in expected.values()))
+          PY
