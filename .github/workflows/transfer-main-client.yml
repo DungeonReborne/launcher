@@ -118,7 +118,7 @@ jobs:
                   print('RETRY_UPLOAD',p['asset'],attempt+1,flush=True);time.sleep(min(300,60*(attempt+1)))
               target.unlink();print('UPLOADED',p['asset'],p['bytes'],flush=True)
           print('PENDING_ASSETS',len(pending),flush=True)
-          with ThreadPoolExecutor(max_workers=8) as pool:list(pool.map(transfer,pending))
+          with ThreadPoolExecutor(max_workers=16) as pool:list(pool.map(transfer,pending))
           current=assets()
           for name,p in expected.items():assert matches(current.get(name),p),name
           assert set(current)==set(expected)|{'client-release.json','client-release.json.sig'}
