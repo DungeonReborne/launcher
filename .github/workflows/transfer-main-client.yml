@@ -1,6 +1,19 @@
 name: Transfer verified MAIN client to Releases
 on:
   workflow_dispatch:
+    inputs:
+      release_id:
+        description: Prepared client draft release ID
+        required: true
+        type: string
+      manifest_sha256:
+        description: SHA-256 of the exact signed transport manifest
+        required: true
+        type: string
+      reuse_tag:
+        description: Previous verified client release tag to reuse unchanged parts
+        required: false
+        type: string
 permissions:
   contents: write
 concurrency:
@@ -13,15 +26,20 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: DungeonReborne/launcher
+      CLIENT_RELEASE_ID: ${{ inputs.release_id }}
+      CLIENT_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
+      CLIENT_REUSE_TAG: ${{ inputs.reuse_tag }}
     steps:
       - name: Transfer exact signed client payload and verify every asset
         shell: bash
         run: |
           python3 - <<'PY'
-          import hashlib,json,pathlib,subprocess,urllib.parse
+          import hashlib,json,os,pathlib,re,subprocess,urllib.parse,urllib.request
+          from concurrent.futures import ThreadPoolExecutor
           REPO='DungeonReborne/launcher'
-          RID=444744062
-          TAG='client-production-0.4.72-bbfa7f0fb57d'
+          RID=int(os.environ['CLIENT_RELEASE_ID'])
+          PIN=os.environ['CLIENT_MANIFEST_SHA256']
+          assert RID>0 and re.fullmatch('[a-f0-9]{64}',PIN)
           def gh(*args):
               return subprocess.check_output(['gh',*args])
           def api(path):
@@ -34,18 +52,39 @@ jobs:
               with path.open('rb') as f:
                   for b in iter(lambda:f.read(4*1024*1024),b''):h.update(b)
               return h.hexdigest()
-          release=api('releases/'+str(RID))
-          assert release['tag_name']==TAG and release['name']=='DungeonReborne MAIN client 0.4.72'
+          release=api('releases/'+str(RID));TAG=release['tag_name']
+          assert re.fullmatch(r'client-production-[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}',TAG)
           current=assets()
           raw=gh('api','repos/'+REPO+'/releases/assets/'+str(current['client-release.json']['id']),'-H','Accept: application/octet-stream')
-          assert hashlib.sha256(raw).hexdigest()=='8b224e627f8d75f3bb2475d08bb91292bbe1c2f192f9b7e0b9095d481a1ed355'
+          assert hashlib.sha256(raw).hexdigest()==PIN
+          signature_digest=current['client-release.json.sig']['digest']
           m=json.loads(raw)
-          assert m['base_url']=='https://dungeonreborne.com/downloads/client/0.4.72/'
-          expected={p['asset']:p for f in m['files'] for p in f['github_parts']}
-          assert len(expected)==472 and len(m['files'])==461
+          assert m['schema']==1 and m['environment']=='production' and m['files']
+          assert TAG.startswith('client-production-'+m['version']+'-')
+          assert m['github_base_url']=='https://github.com/'+REPO+'/releases/download/'+TAG+'/'
+          assert m['base_url']=='https://dungeonreborne.com/downloads/client/'+m['version']+'/'
+          expected={}
+          for f in m['files']:
+              path=pathlib.PurePosixPath(f['path'])
+              assert not path.is_absolute() and '..' not in path.parts and ':' not in f['path']
+              assert sum(p['bytes'] for p in f['github_parts'])==f['bytes']
+              for p in f['github_parts']:
+                  assert re.fullmatch(r'a[0-9]{4}\.bin',p['asset']) and p['asset'] not in expected
+                  assert re.fullmatch('[a-f0-9]{64}',p['sha256']) and 0<p['bytes']<2**31
+                  expected[p['asset']]=p
+          assert 0<len(expected)<=998
+          reuse={};oldtag=os.environ.get('CLIENT_REUSE_TAG','')
+          if oldtag:
+              assert re.fullmatch(r'client-production-[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}',oldtag)
+              base='https://github.com/'+REPO+'/releases/download/'+oldtag+'/'
+              with urllib.request.urlopen(base+'client-release.json',timeout=60) as r:old=json.load(r)
+              assert old['github_base_url']==base
+              for f in old['files']:
+                  for p in f['github_parts']:
+                      assert re.fullmatch(r'a[0-9]{4}\.bin',p['asset'])
+                      reuse[(p['sha256'],p['bytes'])]=base+p['asset']
           def matches(row,p):
               return row and row['state']=='uploaded' and row['size']==p['bytes'] and row.get('digest')=='sha256:'+p['sha256']
-          from concurrent.futures import ThreadPoolExecutor
           pending=[]
           for f in m['files']:
               offset=0
@@ -53,26 +92,28 @@ jobs:
                   old=current.get(p['asset'])
                   if not matches(old,p):
                       if old:
-                          assert old['state']!='uploaded','Refuse replacing an existing complete asset'
+                          assert old['state']!='uploaded','Refuse replacing a completed asset'
                           gh('api','-X','DELETE','repos/'+REPO+'/releases/assets/'+str(old['id']))
                       pending.append((f,p,offset))
                   offset+=p['bytes']
           def transfer(task):
-              f,p,offset=task
-              target=pathlib.Path(p['asset'])
-              url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
-              print('FETCH',p['asset'],p['bytes'],flush=True)
-              subprocess.run(['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','--max-filesize',str(p['bytes']),'--range',str(offset)+'-'+str(offset+p['bytes']-1),'-H','Accept-Encoding: identity','-o',str(target),url],check=True)
+              f,p,offset=task;target=pathlib.Path(p['asset'])
+              url=reuse.get((p['sha256'],p['bytes']))
+              command=['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','--max-filesize',str(p['bytes']),'-H','Accept-Encoding: identity','-o',str(target)]
+              print('FETCH',p['asset'],p['bytes'],'github' if url else 'vps',flush=True)
+              if not url:
+                  url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
+                  command+=['--range',str(offset)+'-'+str(offset+p['bytes']-1)]
+              subprocess.run(command+[url],check=True)
               assert target.stat().st_size==p['bytes'] and sha(target)==p['sha256'],p['asset']
               gh('release','upload',TAG,str(target),'--repo',REPO)
-              target.unlink()
-              print('UPLOADED',p['asset'],p['bytes'],flush=True)
+              target.unlink();print('UPLOADED',p['asset'],p['bytes'],flush=True)
           print('PENDING_ASSETS',len(pending),flush=True)
-          with ThreadPoolExecutor(max_workers=4) as pool:
-              list(pool.map(transfer,pending))
+          with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(transfer,pending))
           current=assets()
           for name,p in expected.items():assert matches(current.get(name),p),name
           assert set(current)==set(expected)|{'client-release.json','client-release.json.sig'}
+          assert current['client-release.json']['digest']=='sha256:'+PIN and current['client-release.json.sig']['digest']==signature_digest
           gh('api','-X','PATCH','repos/'+REPO+'/releases/'+str(RID),'-F','draft=false','-F','prerelease=true','-f','make_latest=false')
-          print('MAIN_GITHUB_PAYLOAD_PUBLISHED',len(expected),sum(p['bytes'] for p in expected.values()))
+          print('MAIN_GITHUB_PAYLOAD_PUBLISHED',TAG,len(expected),sum(p['bytes'] for p in expected.values()))
           PY
