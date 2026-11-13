@@ -45,33 +45,31 @@ jobs:
           assert len(expected)==472 and len(m['files'])==461
           def matches(row,p):
               return row and row['state']=='uploaded' and row['size']==p['bytes'] and row.get('digest')=='sha256:'+p['sha256']
-          source=pathlib.Path('source.tmp')
-          for i,f in enumerate(m['files']):
-              if all(matches(current.get(p['asset']),p) for p in f['github_parts']):
-                  continue
-              url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
-              subprocess.run(['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','-o',str(source),url],check=True)
-              assert source.stat().st_size==f['bytes'] and sha(source)==f['sha256'],f['path']
-              with source.open('rb') as stream:
-                  for p in f['github_parts']:
-                      if matches(current.get(p['asset']),p):
-                          stream.seek(p['bytes'],1)
-                          continue
-                      target=pathlib.Path(p['asset']);remain=p['bytes']
-                      with target.open('wb') as out:
-                          while remain:
-                              block=stream.read(min(remain,4*1024*1024));assert block
-                              out.write(block);remain-=len(block)
-                      assert sha(target)==p['sha256']
-                      old=current.get(p['asset'])
+          from concurrent.futures import ThreadPoolExecutor
+          pending=[]
+          for f in m['files']:
+              offset=0
+              for p in f['github_parts']:
+                  old=current.get(p['asset'])
+                  if not matches(old,p):
                       if old:
                           assert old['state']!='uploaded','Refuse replacing an existing complete asset'
                           gh('api','-X','DELETE','repos/'+REPO+'/releases/assets/'+str(old['id']))
-                      gh('release','upload',TAG,str(target),'--repo',REPO)
-                      target.unlink()
-                      print('UPLOADED',p['asset'],p['bytes'],flush=True)
-              source.unlink()
-              print('FILE_VERIFIED',i+1,len(m['files']),flush=True)
+                      pending.append((f,p,offset))
+                  offset+=p['bytes']
+          def transfer(task):
+              f,p,offset=task
+              target=pathlib.Path(p['asset'])
+              url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
+              print('FETCH',p['asset'],p['bytes'],flush=True)
+              subprocess.run(['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','--max-filesize',str(p['bytes']),'--range',str(offset)+'-'+str(offset+p['bytes']-1),'-H','Accept-Encoding: identity','-o',str(target),url],check=True)
+              assert target.stat().st_size==p['bytes'] and sha(target)==p['sha256'],p['asset']
+              gh('release','upload',TAG,str(target),'--repo',REPO)
+              target.unlink()
+              print('UPLOADED',p['asset'],p['bytes'],flush=True)
+          print('PENDING_ASSETS',len(pending),flush=True)
+          with ThreadPoolExecutor(max_workers=4) as pool:
+              list(pool.map(transfer,pending))
           current=assets()
           for name,p in expected.items():assert matches(current.get(name),p),name
           assert set(current)==set(expected)|{'client-release.json','client-release.json.sig'}
