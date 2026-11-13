@@ -10,8 +10,8 @@ on:
         description: SHA-256 of the exact signed transport manifest
         required: true
         type: string
-      reuse_tag:
-        description: Previous verified client release tag to reuse unchanged parts
+      reuse_release_id:
+        description: Existing client release or draft ID to reuse verified assets
         required: false
         type: string
 permissions:
@@ -22,19 +22,19 @@ concurrency:
 jobs:
   transfer:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: DungeonReborne/launcher
       CLIENT_RELEASE_ID: ${{ inputs.release_id }}
       CLIENT_MANIFEST_SHA256: ${{ inputs.manifest_sha256 }}
-      CLIENT_REUSE_TAG: ${{ inputs.reuse_tag }}
+      CLIENT_REUSE_RELEASE_ID: ${{ inputs.reuse_release_id }}
     steps:
       - name: Transfer exact signed client payload and verify every asset
         shell: bash
         run: |
           python3 - <<'PY'
-          import hashlib,json,os,pathlib,re,subprocess,urllib.parse,urllib.request
+          import hashlib,json,os,pathlib,re,subprocess,time,urllib.parse
           from concurrent.futures import ThreadPoolExecutor
           REPO='DungeonReborne/launcher'
           RID=int(os.environ['CLIENT_RELEASE_ID'])
@@ -44,8 +44,8 @@ jobs:
               return subprocess.check_output(['gh',*args])
           def api(path):
               return json.loads(gh('api','repos/'+REPO+'/'+path))
-          def assets():
-              pages=json.loads(gh('api','repos/'+REPO+'/releases/'+str(RID)+'/assets?per_page=100','--paginate','--slurp'))
+          def assets(release_id=RID):
+              pages=json.loads(gh('api','repos/'+REPO+'/releases/'+str(release_id)+'/assets?per_page=100','--paginate','--slurp'))
               return {x['name']:x for page in pages for x in page}
           def sha(path):
               h=hashlib.sha256()
@@ -73,16 +73,13 @@ jobs:
                   assert re.fullmatch('[a-f0-9]{64}',p['sha256']) and 0<p['bytes']<2**31
                   expected[p['asset']]=p
           assert 0<len(expected)<=998
-          reuse={};oldtag=os.environ.get('CLIENT_REUSE_TAG','')
-          if oldtag:
-              assert re.fullmatch(r'client-production-[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}',oldtag)
-              base='https://github.com/'+REPO+'/releases/download/'+oldtag+'/'
-              with urllib.request.urlopen(base+'client-release.json',timeout=60) as r:old=json.load(r)
-              assert old['github_base_url']==base
-              for f in old['files']:
-                  for p in f['github_parts']:
-                      assert re.fullmatch(r'a[0-9]{4}\.bin',p['asset'])
-                      reuse[(p['sha256'],p['bytes'])]=base+p['asset']
+          reuse={};old_id=os.environ.get('CLIENT_REUSE_RELEASE_ID','')
+          if old_id:
+              old_id=int(old_id);assert old_id>0 and old_id!=RID
+              for row in assets(old_id).values():
+                  digest=row.get('digest') or ''
+                  if row['state']=='uploaded' and re.fullmatch('sha256:[a-f0-9]{64}',digest):
+                      reuse[(digest[7:],row['size'])]=row['id']
           def matches(row,p):
               return row and row['state']=='uploaded' and row['size']==p['bytes'] and row.get('digest')=='sha256:'+p['sha256']
           pending=[]
@@ -98,18 +95,30 @@ jobs:
                   offset+=p['bytes']
           def transfer(task):
               f,p,offset=task;target=pathlib.Path(p['asset'])
-              url=reuse.get((p['sha256'],p['bytes']))
+              source_id=reuse.get((p['sha256'],p['bytes']))
               command=['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','--max-filesize',str(p['bytes']),'-H','Accept-Encoding: identity','-o',str(target)]
-              print('FETCH',p['asset'],p['bytes'],'github' if url else 'vps',flush=True)
-              if not url:
+              print('FETCH',p['asset'],p['bytes'],'github' if source_id else 'vps',flush=True)
+              if source_id:
+                  with target.open('wb') as out:
+                      subprocess.run(['gh','api','repos/'+REPO+'/releases/assets/'+str(source_id),'-H','Accept: application/octet-stream'],stdout=out,check=True)
+              else:
                   url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
                   command+=['--range',str(offset)+'-'+str(offset+p['bytes']-1)]
-              subprocess.run(command+[url],check=True)
+                  subprocess.run(command+[url],check=True)
               assert target.stat().st_size==p['bytes'] and sha(target)==p['sha256'],p['asset']
-              gh('release','upload',TAG,str(target),'--repo',REPO)
+              for attempt in range(7):
+                  result=subprocess.run(['gh','release','upload',TAG,str(target),'--repo',REPO],capture_output=True)
+                  if result.returncode==0:break
+                  row=assets().get(p['asset'])
+                  if matches(row,p):break
+                  if row:
+                      assert row['state']!='uploaded','Completed upload has a different digest'
+                      gh('api','-X','DELETE','repos/'+REPO+'/releases/assets/'+str(row['id']))
+                  if attempt==6:raise RuntimeError(result.stderr.decode(errors='replace')[-1000:])
+                  print('RETRY_UPLOAD',p['asset'],attempt+1,flush=True);time.sleep(min(300,60*(attempt+1)))
               target.unlink();print('UPLOADED',p['asset'],p['bytes'],flush=True)
           print('PENDING_ASSETS',len(pending),flush=True)
-          with ThreadPoolExecutor(max_workers=4) as pool:list(pool.map(transfer,pending))
+          with ThreadPoolExecutor(max_workers=8) as pool:list(pool.map(transfer,pending))
           current=assets()
           for name,p in expected.items():assert matches(current.get(name),p),name
           assert set(current)==set(expected)|{'client-release.json','client-release.json.sig'}
