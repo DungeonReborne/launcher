@@ -70,7 +70,7 @@ jobs:
               for row in assets(old_id).values():
                   digest=row.get('digest') or ''
                   if row['state']=='uploaded' and re.fullmatch('sha256:[a-f0-9]{64}',digest):
-                      reuse[(digest[7:],row['size'])]=row['id']
+                      reuse[(digest[7:],row['size'])]=row['browser_download_url']
           def matches(row,p):
               return row and row['state']=='uploaded' and row['size']==p['bytes'] and row.get('digest')=='sha256:'+p['sha256']
           pending=[]
@@ -90,13 +90,9 @@ jobs:
               assert source_id,'This one-off transfer must reuse published .73 assets; new MapSelect asset must already be attached'
               command=['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','--max-filesize',str(p['bytes']),'-H','Accept-Encoding: identity','-o',str(target)]
               print('FETCH',p['asset'],p['bytes'],'github' if source_id else 'vps',flush=True)
-              if source_id:
-                  with target.open('wb') as out:
-                      subprocess.run(['gh','api','repos/'+REPO+'/releases/assets/'+str(source_id),'-H','Accept: application/octet-stream'],stdout=out,check=True)
-              else:
-                  url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
-                  command+=['--range',str(offset)+'-'+str(offset+p['bytes']-1)]
-                  subprocess.run(command+[url],check=True)
+              assert re.fullmatch(r'https://github\.com/DungeonReborne/launcher/releases/download/client-production-0\.4\.73-ca0fd9428f5a/a[0-9]{4}\.bin',source_id),'Unexpected published reuse URL'
+              command+=['-H','Cache-Control: no-cache']
+              subprocess.run(command+[source_id],check=True)
               assert target.stat().st_size==p['bytes'] and sha(target)==p['sha256'],p['asset']
               for attempt in range(7):
                   result=subprocess.run(['gh','release','upload',TAG,str(target),'--repo',REPO],capture_output=True)
