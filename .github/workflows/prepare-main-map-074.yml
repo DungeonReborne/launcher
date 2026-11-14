@@ -1,0 +1,124 @@
+name: Prepare MAIN MapSelect 0.4.74
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: main-client-github-transfer
+  cancel-in-progress: false
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: DungeonReborne/launcher
+      CLIENT_MANIFEST_SHA256: 47daaa281ef7b9900193c5191204248460c5468f2c242e19ca04ebe2e2f1c829
+      CLIENT_REUSE_RELEASE_ID: 444785897
+    steps:
+      - name: Transfer exact signed client payload and verify every asset
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess,time,urllib.parse
+          from concurrent.futures import ThreadPoolExecutor
+          REPO='DungeonReborne/launcher'
+          TARGET_TAG='client-production-0.4.74-5ab5e9e459c6'
+          pages=json.loads(subprocess.check_output(['gh','api','repos/'+REPO+'/releases?per_page=100','--paginate','--slurp']))
+          candidates=[r for page in pages for r in page if r['tag_name']==TARGET_TAG and r['draft']]
+          assert len(candidates)==1,'Expected exactly one approved .74 draft'
+          RID=candidates[0]['id']
+          PIN=os.environ['CLIENT_MANIFEST_SHA256']
+          assert RID>0 and re.fullmatch('[a-f0-9]{64}',PIN)
+          def gh(*args):
+              return subprocess.check_output(['gh',*args])
+          def api(path):
+              return json.loads(gh('api','repos/'+REPO+'/'+path))
+          def assets(release_id=RID):
+              pages=json.loads(gh('api','repos/'+REPO+'/releases/'+str(release_id)+'/assets?per_page=100','--paginate','--slurp'))
+              return {x['name']:x for page in pages for x in page}
+          def sha(path):
+              h=hashlib.sha256()
+              with path.open('rb') as f:
+                  for b in iter(lambda:f.read(4*1024*1024),b''):h.update(b)
+              return h.hexdigest()
+          release=api('releases/'+str(RID));TAG=release['tag_name']
+          assert release['draft'], 'Transfer-only workflow requires a draft; publication is a separate approved action'
+          assert re.fullmatch(r'client-production-[0-9]+\.[0-9]+\.[0-9]+-[a-f0-9]{12}',TAG)
+          current=assets()
+          raw=gh('api','repos/'+REPO+'/releases/assets/'+str(current['client-release.json']['id']),'-H','Accept: application/octet-stream')
+          assert hashlib.sha256(raw).hexdigest()==PIN
+          signature_digest=current['client-release.json.sig']['digest']
+          m=json.loads(raw)
+          assert m['schema']==1 and m['environment']=='production' and m['files']
+          assert TAG.startswith('client-production-'+m['version']+'-')
+          assert m['github_base_url']=='https://github.com/'+REPO+'/releases/download/'+TAG+'/'
+          assert m['base_url']=='https://dungeonreborne.com/downloads/client/'+m['version']+'/'
+          expected={}
+          for f in m['files']:
+              path=pathlib.PurePosixPath(f['path'])
+              assert not path.is_absolute() and '..' not in path.parts and ':' not in f['path']
+              assert sum(p['bytes'] for p in f['github_parts'])==f['bytes']
+              for p in f['github_parts']:
+                  assert re.fullmatch(r'a[0-9]{4}\.bin',p['asset']) and p['asset'] not in expected
+                  assert re.fullmatch('[a-f0-9]{64}',p['sha256']) and 0<p['bytes']<2**31
+                  expected[p['asset']]=p
+          assert 0<len(expected)<=998
+          reuse={};old_id=os.environ.get('CLIENT_REUSE_RELEASE_ID','')
+          if old_id:
+              old_id=int(old_id);assert old_id>0 and old_id!=RID
+              for row in assets(old_id).values():
+                  digest=row.get('digest') or ''
+                  if row['state']=='uploaded' and re.fullmatch('sha256:[a-f0-9]{64}',digest):
+                      reuse[(digest[7:],row['size'])]=row['id']
+          def matches(row,p):
+              return row and row['state']=='uploaded' and row['size']==p['bytes'] and row.get('digest')=='sha256:'+p['sha256']
+          pending=[]
+          for f in m['files']:
+              offset=0
+              for p in f['github_parts']:
+                  old=current.get(p['asset'])
+                  if not matches(old,p):
+                      if old:
+                          assert old['state']!='uploaded','Refuse replacing a completed asset'
+                          gh('api','-X','DELETE','repos/'+REPO+'/releases/assets/'+str(old['id']))
+                      pending.append((f,p,offset))
+                  offset+=p['bytes']
+          def transfer(task):
+              f,p,offset=task;target=pathlib.Path(p['asset'])
+              source_id=reuse.get((p['sha256'],p['bytes']))
+              assert source_id,'This one-off transfer must reuse published .73 assets; new MapSelect asset must already be attached'
+              command=['curl','--fail','--location','--silent','--show-error','--retry','5','--retry-all-errors','--connect-timeout','30','--max-time','1800','--max-filesize',str(p['bytes']),'-H','Accept-Encoding: identity','-o',str(target)]
+              print('FETCH',p['asset'],p['bytes'],'github' if source_id else 'vps',flush=True)
+              if source_id:
+                  with target.open('wb') as out:
+                      subprocess.run(['gh','api','repos/'+REPO+'/releases/assets/'+str(source_id),'-H','Accept: application/octet-stream'],stdout=out,check=True)
+              else:
+                  url=m['base_url']+urllib.parse.quote(f['path'],safe='/')
+                  command+=['--range',str(offset)+'-'+str(offset+p['bytes']-1)]
+                  subprocess.run(command+[url],check=True)
+              assert target.stat().st_size==p['bytes'] and sha(target)==p['sha256'],p['asset']
+              for attempt in range(7):
+                  result=subprocess.run(['gh','release','upload',TAG,str(target),'--repo',REPO],capture_output=True)
+                  if result.returncode==0:break
+                  row=assets().get(p['asset'])
+                  if matches(row,p):break
+                  if row:
+                      assert row['state']!='uploaded','Completed upload has a different digest'
+                      gh('api','-X','DELETE','repos/'+REPO+'/releases/assets/'+str(row['id']))
+                  if attempt==6:raise RuntimeError(result.stderr.decode(errors='replace')[-1000:])
+                  print('RETRY_UPLOAD',p['asset'],attempt+1,flush=True);time.sleep(min(300,60*(attempt+1)))
+              target.unlink();print('UPLOADED',p['asset'],p['bytes'],flush=True)
+          print('PENDING_ASSETS',len(pending),flush=True)
+          with ThreadPoolExecutor(max_workers=16) as pool:list(pool.map(transfer,pending))
+          current=assets()
+          for name,p in expected.items():assert matches(current.get(name),p),name
+          assert set(current)==set(expected)|{'client-release.json','client-release.json.sig'}
+          assert current['client-release.json']['digest']=='sha256:'+PIN and current['client-release.json.sig']['digest']==signature_digest
+          assert api('releases/'+str(RID))['draft'], 'Draft state changed during preparation'
+          receipt={'release_id':RID,'tag':TAG,'manifest_sha256':PIN,'assets':len(expected),'bytes':sum(p['bytes'] for p in expected.values()),'all_sizes_verified':True,'all_sha256_verified':True,'draft':True,'published':False}
+          print('MAIN_GITHUB_PAYLOAD_STAGED',json.dumps(receipt,sort_keys=True),flush=True)
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary:
+              summary.write('Verified client remains a draft. Publication requires a separate explicit approval.\n\n')
+              summary.write('```json\n'+json.dumps(receipt,indent=2)+'\n```\n')
+          PY
